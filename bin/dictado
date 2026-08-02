@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+# dictado — local voice dictation for Hyprland. No cloud, no account.
+#
+#   pw-record   -> records from the mic (PipeWire)
+#   whisper-cli -> transcribes locally
+#   wtype       -> types into the focused window
+#   qs -c dictado -> visual overlay
+#
+# Usage:
+#   dictado start   (start recording)
+#   dictado stop    (stop, transcribe and insert)
+#   dictado toggle  (alternate between the two)
+#
+# Bind it in Hyprland; see the README for both config formats.
+
+set -uo pipefail
+
+MODEL="${DICTADO_MODEL:-$HOME/.local/share/whisper-models/ggml-large-v3-turbo.bin}"
+LANG="${DICTADO_LANG:-en}"
+PORT="${DICTADO_PORT:-8080}"
+# paste = clipboard + paste via Hyprland (DEFAULT). The only reliable method
+#         for Electron apps: the text travels whole, without being typed.
+# type   = direct typing with wtype. Measured: works in foot and in GTK apps,
+#         but in Electron it drops everything from the first non-ASCII
+#         character on ("...and tom" instead of "...and tomorrow we'll cook").
+METHOD="${DICTADO_METHOD:-paste}"
+# ALSA card for the microphone. Auto-detected: card 0 is usually the GPU's
+# HDMI audio, not the mic.
+CARD="${DICTADO_CARD:-$(grep -l "Mic Boost" /proc/asound/card*/codec* 2>/dev/null \
+      | head -1 | sed -n 's|.*/card\([0-9]\+\)/.*|\1|p')}"
+CARD="${CARD:-1}"
+# Capture at 100% (+30 dB) WITH Mic Boost at 0. Measured: the one clipping was
+# the Boost, not the Capture. With both maxed out (+60 dB) the mean sat at
+# -2.5 dB (clipping); with Capture at 40% and Boost 0 it dropped to -49 dB
+# (far too quiet).
+GAIN="${DICTADO_GAIN:-100%}"
+
+# Biases recognition towards your own vocabulary. Whisper responds better to
+# NATURAL PROSE than to word lists: imitate the style of your usual text.
+# Edit at ~/.config/dictado/prompt.txt
+PROMPT_FILE="$HOME/.config/dictado/prompt.txt"
+PROMPT="${DICTADO_PROMPT:-}"
+[[ -z "$PROMPT" && -f "$PROMPT_FILE" ]] && PROMPT=$(cat "$PROMPT_FILE")
+
+# Deterministic fixes for what the prompt can't solve. One per line, format
+#   wrong<TAB>right   (applied to whole words only).
+# Edit at ~/.config/dictado/corrections.tsv
+FIXES_FILE="$HOME/.config/dictado/corrections.tsv"
+
+RUN="${XDG_RUNTIME_DIR:-/tmp}/dictado"
+WAV="$RUN/audio.wav"
+PIDFILE="$RUN/record.pid"
+
+mkdir -p "$RUN"
+
+# The overlay is optional: if it isn't running, dictation still works.
+overlay() { qs -c dictado ipc call overlay "$1" >/dev/null 2>&1 || true; }
+
+notify() { command -v notify-send >/dev/null && notify-send -a dictado "$1" "${2:-}" || true; }
+
+start() {
+    if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        return 0  # already recording
+    fi
+    if [[ ! -f "$MODEL" ]]; then
+        notify "dictado" "Model not found: $MODEL"
+        exit 1
+    fi
+
+    rm -f "$WAV"
+
+    # WirePlumber restores its ALSA mixer state between sessions and pushes the
+    # gain back to maximum (+30 dB of Capture and +30 of Mic Boost). At that
+    # level the signal clips (mean -2.5 dB, peaks at 0 dB) and Whisper
+    # transcribes distorted audio. It is reapplied on every recording because
+    # that is the only moment we know it will stick: measured, it survives the
+    # start of the stream.
+    if [[ -n "$CARD" ]]; then
+        amixer -c "$CARD" sset "Mic Boost" 0 >/dev/null 2>&1
+        amixer -c "$CARD" sset "Capture" "$GAIN" >/dev/null 2>&1
+    fi
+
+    # Whisper requires 16 kHz mono.
+    pw-record --rate 16000 --channels 1 --format s16 "$WAV" &
+    echo $! > "$PIDFILE"
+    overlay listening
+}
+
+stop() {
+    [[ -f "$PIDFILE" ]] || exit 0
+    local pid; pid=$(cat "$PIDFILE")
+    rm -f "$PIDFILE"
+
+    # Tail: you release the key right as the last word ends, so cutting at that
+    # instant eats it. 250 ms of margin rescue it unnoticeably. (The start needs
+    # no equivalent: measured at 39 ms from command to first audio.)
+    sleep 0.25
+
+    # SIGINT (not SIGKILL) so pw-record closes the WAV header properly.
+    kill -INT "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+
+    # Under ~0.3 s of audio: accidental key press, discard it.
+    if [[ ! -s "$WAV" ]] || [[ $(stat -c%s "$WAV" 2>/dev/null || echo 0) -lt 10000 ]]; then
+        overlay hide
+        exit 0
+    fi
+
+    overlay working
+
+    local text
+    # Fast path: whisper-server already has the model loaded in RAM (~0.6 s).
+    local -a curl_args=(
+        -F "file=@$WAV"
+        -F "language=$LANG"
+        -F "response_format=text"
+    )
+    [[ -n "$PROMPT" ]] && curl_args+=(-F "prompt=$PROMPT")
+
+    text=$(curl -s --max-time 60 "${curl_args[@]}" \
+        "http://127.0.0.1:$PORT/inference" 2>/dev/null)
+
+    # Fallback: if the service is down, transcribe on the spot. Works the same,
+    # but the first run takes ~14 s loading the model.
+    if [[ -z "$text" ]]; then
+        text=$(whisper-cli \
+            --model "$MODEL" \
+            --language "$LANG" \
+            --threads 8 \
+            --no-timestamps \
+            --no-prints \
+            --output-txt --output-file "$RUN/out" \
+            "$WAV" >/dev/null 2>&1 && cat "$RUN/out.txt" 2>/dev/null)
+    fi
+
+    overlay hide
+
+    # Strip leftover whitespace and the newlines whisper inserts.
+    text=$(printf '%s' "$text" | tr '\n' ' ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/  */ /g')
+
+    # Whisper marks silence with annotations like [BLANK_AUDIO] or (music).
+    if [[ -z "$text" ]] || [[ "$text" =~ ^\[.*\]$ ]] || [[ "$text" =~ ^\(.*\)$ ]]; then
+        exit 0
+    fi
+
+    # Deterministic corrections. The prompt only biases; for words that sound
+    # practically identical ("Claude" ~ "cloud" ~ "Claudio") you need direct
+    # substitution. Whole words only (\b), so terms containing them survive.
+    if [[ -f "$FIXES_FILE" ]]; then
+        while IFS=$'\t' read -r bad good; do
+            [[ -z "$bad" || "$bad" == \#* ]] && continue
+            text=$(printf '%s' "$text" | sed -E "s/\b${bad}\b/${good}/gI")
+        done < "$FIXES_FILE"
+    fi
+
+    case "$METHOD" in
+        type)
+            # Passed through stdin ('-'), not as an argument: that way text
+            # starting with '-' is never read as a flag.
+            # Verified: arrives intact in foot and GTK apps. In Electron it does
+            # NOT: it cuts at the first non-ASCII character. Hence the default
+            # method being 'paste'.
+            printf '%s' "$text" | wtype -d 12 -
+            ;;
+        *)
+            # Clipboard + paste. The text travels WHOLE, so accents and ñ are
+            # immune to wtype's keymap problem.
+            #
+            # The paste keystroke is sent by HYPRLAND (hl.dsp.send_shortcut),
+            # not by wtype. That is the key difference: wtype sends modifiers
+            # through its virtual keymap and the compositor resolves them
+            # against the physical keycode, firing unrelated shortcuts
+            # (Ctrl+Shift+V ended up opening btop, bound to Ctrl+Shift+Escape).
+            # send_shortcut uses Hyprland's own machinery and has no such
+            # mismatch.
+            local clip_backup="$RUN/clip.bak"
+            wl-paste --no-newline > "$clip_backup" 2>/dev/null || : > "$clip_backup"
+
+            printf '%s' "$text" | wl-copy
+            sleep 0.1
+
+            # Terminals paste with Ctrl+Shift+V; everything else, Ctrl+V.
+            local cls mods
+            cls=$(hyprctl activewindow -j 2>/dev/null \
+                  | sed -n 's/.*"class": *"\([^"]*\)".*/\1/p' | head -1)
+
+            case "${cls,,}" in
+                foot|kitty|alacritty|ghostty|wezterm|st|urxvt|xterm|*terminal*|*konsole*)
+                    mods="CTRL SHIFT" ;;
+                *)
+                    mods="CTRL" ;;
+            esac
+
+            hyprctl dispatch \
+                "hl.dsp.send_shortcut({ mods = \"$mods\", key = \"V\", window = \"activewindow\" })" \
+                >/dev/null 2>&1
+
+            # Restore the clipboard to its previous state: dictating shouldn't
+            # cost you whatever you had copied.
+            ( sleep 0.8; wl-copy < "$clip_backup" 2>/dev/null ) &
+            ;;
+    esac
+}
+
+case "${1:-toggle}" in
+    start) start ;;
+    stop)  stop ;;
+    toggle)
+        if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            stop
+        else
+            start
+        fi
+        ;;
+    *) echo "usage: dictado {start|stop|toggle}" >&2; exit 2 ;;
+esac

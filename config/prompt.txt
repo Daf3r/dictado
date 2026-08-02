@@ -1,0 +1,1 @@
+I work daily with Linux, Hyprland and Wayland on Arch. I write shell scripts, configure systemd units, and use PipeWire for audio. I talk about Quickshell, whisper.cpp and GPU acceleration through Vulkan.

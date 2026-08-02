@@ -1,0 +1,1 @@
+Trabajo a diario con Claude y Claude Code de Anthropic. Mi escritorio es caelestia sobre Hyprland en Arch Linux con Wayland, y configuro systemd, Quickshell y PipeWire. Mi proyecto se llama pzget y sirve para instalar paquetes.

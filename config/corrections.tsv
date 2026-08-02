@@ -1,0 +1,11 @@
+# Deterministic fixes applied after transcription.
+# Format:  wrong<TAB>right   — whole words only, case-insensitive.
+# Lines starting with # are ignored.
+#
+# Use this for words the prompt can't fix on its own: names and jargon that
+# sound almost identical to a common word.
+cloud code	Claude Code
+hyper land	Hyprland
+way land	Wayland
+pipe wire	PipeWire
+system d	systemd
