@@ -1,5 +1,10 @@
 # dictado
 
+[![Release](https://img.shields.io/github/v/release/Daf3r/dictado?style=flat-square&color=8b5cf6)](https://github.com/Daf3r/dictado/releases)
+[![License](https://img.shields.io/github/license/Daf3r/dictado?style=flat-square&color=8b5cf6)](LICENSE)
+![Hyprland only](https://img.shields.io/badge/Hyprland-required-8b5cf6?style=flat-square)
+![100% local](https://img.shields.io/badge/inference-100%25%20local-8b5cf6?style=flat-square)
+
 Hold a key, speak, release. The text appears in whatever window has focus.
 
 Local voice dictation for **Hyprland**, powered by [whisper.cpp](https://github.com/ggml-org/whisper.cpp).
